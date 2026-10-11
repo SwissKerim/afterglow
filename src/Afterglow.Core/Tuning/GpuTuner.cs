@@ -405,9 +405,8 @@ public sealed class GpuTuner : IGpuTuner
 
             if (Capabilities.SupportsPowerLimit && Capabilities.PowerLimitDefaultW > 0)
             {
-                Report(results, "power limit",
-                    _nvml.TrySetPowerLimit((uint)(Capabilities.PowerLimitDefaultW * 1000)),
-                    $"{Capabilities.PowerLimitDefaultW:F0} W");
+                results.Add(WritePowerLimitVerified(Capabilities.PowerLimitDefaultW,
+                    $"{Capabilities.PowerLimitDefaultW:F0} W"));
             }
 
             if (Capabilities.SupportsTempLimit && _nvapi is not null)
@@ -787,22 +786,60 @@ public sealed class GpuTuner : IGpuTuner
             ? $"{clamped:F0} W (requested {watts:F0}, clamped to {Capabilities.PowerLimitMinW:F0}..{Capabilities.PowerLimitMaxW:F0})"
             : $"{clamped:F0} W";
 
-        var rc = _nvml.TrySetPowerLimit((uint)(clamped * 1000));
-        if (rc == NvmlReturn.Success &&
-            _nvml.TryGetEnforcedPowerLimit(out uint enforcedMw) == NvmlReturn.Success)
-        {
-            double enforcedW = enforcedMw / 1000.0;
-            if (Math.Abs(enforcedW - clamped) > 1.5)
-            {
-                results.Add(KnobResult.Fail("power limit",
-                    $"driver accepted the call but enforces {enforcedW:F0} W"));
-                return;
-            }
+        results.Add(WritePowerLimitVerified(clamped, detail));
+    }
 
-            detail += " (verified)";
+    private KnobResult WritePowerLimitVerified(double watts, string detail) =>
+        SetPowerLimitVerified(watts, detail, _nvml.TrySetPowerLimit,
+            () =>
+            {
+                var status = _nvml.TryGetEnforcedPowerLimit(out uint milliwatts);
+                return (status, milliwatts);
+            }, () => Thread.Sleep(100));
+
+    /// <summary>
+    /// The enforced limit may lag an accepted write. Both apply and reset wait
+    /// for a successful matching read, with at most twenty 100 ms retry waits.
+    /// Injected delegates keep propagation-delay tests off the live GPU.
+    /// </summary>
+    internal static KnobResult SetPowerLimitVerified(double watts, string detail,
+        Func<uint, NvmlReturn> write,
+        Func<(NvmlReturn Status, uint Milliwatts)> read,
+        Action wait)
+    {
+        const string knob = "power limit";
+        var written = write((uint)(watts * 1000));
+        if (written != NvmlReturn.Success)
+        {
+            return KnobResult.Fail(knob, $"write failed: {written}");
         }
 
-        Report(results, "power limit", rc, detail);
+        NvmlReturn lastStatus = NvmlReturn.Success;
+        double? lastObservedW = null;
+        for (int attempt = 0; attempt <= 20; attempt++)
+        {
+            if (attempt > 0)
+            {
+                wait();
+            }
+
+            var observed = read();
+            lastStatus = observed.Status;
+            if (observed.Status == NvmlReturn.Success)
+            {
+                lastObservedW = observed.Milliwatts / 1000.0;
+                if (Math.Abs(lastObservedW.Value - watts) <= 1.5)
+                {
+                    return KnobResult.Ok(knob, detail + " (verified)");
+                }
+            }
+        }
+
+        string observedDetail = lastObservedW is double last
+            ? $"; last observed {last:F1} W (requested {watts:F1} W)"
+            : "; enforced limit unavailable";
+        return KnobResult.Fail(knob,
+            $"driver accepted the call but not verified after 21 reads and 2 s retry wait; last read {lastStatus}{observedDetail}");
     }
 
     private void ApplyTempLimit(TuningProfile profile, List<KnobResult> results)
