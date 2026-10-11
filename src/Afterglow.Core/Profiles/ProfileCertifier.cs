@@ -25,7 +25,8 @@ public sealed record CertifierStatus(
     /// Whether the GPU was actually returned to driver defaults after a failure.
     /// <para>
     /// Null means no reset was attempted on this path — which is the case for an
-    /// apply failure, where a partially applied profile is still on the card.
+    /// apply failure, where a partially applied profile is still on the card, or
+    /// an unconfirmed workload stop, where resetting could raise power during active work.
     /// The UI used to assert "the GPU was reset to driver defaults" for every
     /// failure, including that one, and the reset's own return value was
     /// discarded so a refused reset read exactly like a successful one.
@@ -38,13 +39,14 @@ public sealed record CertifierStatus(
 /// modes against it in sequence — sustained burn, transition cycling, boost
 /// excursions, and the full-VRAM test. Every pass is stamped into the profile
 /// (pinned to the tested offsets); passing all four marks the profile stable.
-/// A failure stops the run and resets the GPU to driver defaults, because the
-/// config just proved itself unsafe.
+/// A failure resets the GPU to driver defaults only after the workload stop is confirmed.
+/// An unconfirmed stop leaves recovery to the caller after it establishes that GPU work ended.
 /// </summary>
 public sealed class ProfileCertifier
 {
     private readonly IGpuTuner _tuner;
     private readonly ProfileStore _store;
+    private readonly Func<string, int, TimeSpan, (bool Passed, string Evidence, string? FailDetail, bool WorkloadStopped)>? _runMode;
     private readonly object _lock = new();
     private readonly List<string> _log = [];
     private Thread? _thread;
@@ -55,11 +57,18 @@ public sealed class ProfileCertifier
 
     public ProfileCertifier(IGpuTuner tuner, ProfileStore store, uint? pciBusId = null,
         uint vendorId = Stress.StressAdapter.NvidiaVendorId)
+        : this(tuner, store, pciBusId, vendorId, null)
+    {
+    }
+
+    internal ProfileCertifier(IGpuTuner tuner, ProfileStore store, uint? pciBusId, uint vendorId,
+        Func<string, int, TimeSpan, (bool Passed, string Evidence, string? FailDetail, bool WorkloadStopped)>? runMode)
     {
         _tuner = tuner;
         _store = store;
         _pciBusId = pciBusId;
         _vendorId = vendorId;
+        _runMode = runMode;
     }
 
     /// <summary>Binds the stress engines to the tuned card on multi-GPU systems.</summary>
@@ -151,7 +160,9 @@ public sealed class ProfileCertifier
                 mode == CertificationModes.Transitions ? Math.Max(seconds, 90) : seconds);
 
             Log($"[{i + 1}/4] {ModeTitle(mode)} for {duration.TotalSeconds:F0} s…");
-            (bool passed, string evidence, string? failDetail) = mode == CertificationModes.Vram
+            (bool passed, string evidence, string? failDetail, bool workloadStopped) = _runMode is { } runMode
+                ? runMode(mode, i, duration)
+                : mode == CertificationModes.Vram
                 ? RunVramMode(i, duration)
                 : RunStressMode(mode, i, duration);
 
@@ -165,6 +176,14 @@ public sealed class ProfileCertifier
             if (!passed)
             {
                 Log($"{ModeTitle(mode)} FAILED: {failDetail}");
+                if (!workloadStopped)
+                {
+                    Log("The workload stop was not confirmed. Driver-default reset is withheld while GPU work " +
+                        "may still be active; stop the owned workload and verify its exit before recovery.");
+                    Publish(false, "failed", i, TimeSpan.Zero, TimeSpan.Zero, passed: false, failedMode: mode);
+                    return;
+                }
+
                 Log("Resetting to driver defaults — this configuration just proved unstable.");
 
                 // The reset's answer decides what may be claimed. Discarding it
@@ -295,7 +314,7 @@ public sealed class ProfileCertifier
             : null;
     }
 
-    private (bool Passed, string Evidence, string? FailDetail) RunStressMode(
+    private (bool Passed, string Evidence, string? FailDetail, bool WorkloadStopped) RunStressMode(
         string mode, int modeIndex, TimeSpan duration)
     {
         var pattern = mode switch
@@ -342,20 +361,20 @@ public sealed class ProfileCertifier
 
         if (final.State is StressState.ArtifactDetected or StressState.DeviceLost or StressState.Failed)
         {
-            return (false, string.Empty, final.Detail ?? final.State.ToString());
+            return (false, string.Empty, final.Detail ?? final.State.ToString(), stoppedCleanly);
         }
 
         if (!stoppedCleanly)
         {
             return (false, string.Empty,
                 "The burn did not stop within 30 s, so its result is a stale mid-run snapshot with no " +
-                "final verification — no stability verdict can be drawn from it.");
+                "final verification — no stability verdict can be drawn from it.", stoppedCleanly);
         }
 
         if (final.State is not StressState.Stopped)
         {
             return (false, string.Empty,
-                $"The burn ended in an unexpected state ({final.State}) — no stability verdict can be drawn from it.");
+                $"The burn ended in an unexpected state ({final.State}) — no stability verdict can be drawn from it.", stoppedCleanly);
         }
 
         // The engine's own evidence rule: load dispatches actually ran (the
@@ -366,7 +385,7 @@ public sealed class ProfileCertifier
         if (final.VerdictGap is { } gap)
         {
             return (false, string.Empty,
-                $"{char.ToUpperInvariant(gap[0])}{gap[1..]} — no certification can be stamped from it.");
+                $"{char.ToUpperInvariant(gap[0])}{gap[1..]} — no certification can be stamped from it.", stoppedCleanly);
         }
 
         string evidence = pattern switch
@@ -381,10 +400,10 @@ public sealed class ProfileCertifier
                 CultureInfo.InvariantCulture,
                 $"{final.TotalDispatches} dispatches, 0 errors"),
         };
-        return (true, evidence, null);
+        return (true, evidence, null, stoppedCleanly);
     }
 
-    private (bool Passed, string Evidence, string? FailDetail) RunVramMode(int modeIndex, TimeSpan duration)
+    private (bool Passed, string Evidence, string? FailDetail, bool WorkloadStopped) RunVramMode(int modeIndex, TimeSpan duration)
     {
         using var vram = new VramTest
         {
@@ -423,7 +442,7 @@ public sealed class ProfileCertifier
 
         if (final.State is StressState.ArtifactDetected or StressState.DeviceLost or StressState.Failed)
         {
-            return (false, string.Empty, final.Detail ?? final.State.ToString());
+            return (false, string.Empty, final.Detail ?? final.State.ToString(), stoppedCleanly);
         }
 
         // Same rule as the burn: an abandoned run leaves a stale snapshot
@@ -432,7 +451,7 @@ public sealed class ProfileCertifier
         {
             return (false, string.Empty,
                 "The VRAM test did not stop within 30 s, so its result is a stale mid-run snapshot — " +
-                "no stability verdict can be drawn from it.");
+                "no stability verdict can be drawn from it.", stoppedCleanly);
         }
 
         // Same terminal-state guard the burn twin got: only a run that reached
@@ -440,13 +459,13 @@ public sealed class ProfileCertifier
         if (final.State is not StressState.Stopped)
         {
             return (false, string.Empty,
-                $"The VRAM test ended in an unexpected state ({final.State}) — no stability verdict can be drawn from it.");
+                $"The VRAM test ended in an unexpected state ({final.State}) — no stability verdict can be drawn from it.", stoppedCleanly);
         }
 
         if (final.Rounds < 1)
         {
             return (false, string.Empty,
-                "The VRAM test did not complete a full coverage round in the allotted time.");
+                "The VRAM test did not complete a full coverage round in the allotted time.", stoppedCleanly);
         }
 
         // A UMA pass must not be stamped with dedicated-VRAM meaning: the
@@ -460,7 +479,7 @@ public sealed class ProfileCertifier
             evidence += $" — {note}";
         }
 
-        return (true, evidence, null);
+        return (true, evidence, null, stoppedCleanly);
     }
 
     private void StampCertification(TuningProfile profile, string mode, int seconds, string evidence)
